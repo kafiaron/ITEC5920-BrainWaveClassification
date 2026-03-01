@@ -12,16 +12,30 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.constraints import max_norm
 from tensorflow.keras.callbacks import EarlyStopping
+import tensorflow as tf
+
+# Seed for reproducibility
+np.random.seed(42)
+tf.random.set_seed(42)
 
 os.makedirs("results", exist_ok=True)
 
-# Load and Normalize
-data_path = "P4"
-X, y = build_dataset(data_path)
+# Load and Normalize for each subject
+from load_data import load_subject
 
-mean = X.mean(axis=(0, 1), keepdims=True)
-std  = X.std(axis=(0, 1),  keepdims=True) + 1e-8
-X    = (X - mean) / std
+SUBJECTS = ["aa", "al", "av", "aw", "ay"]
+X_list, y_list = [], []
+
+for subj in SUBJECTS:
+    X_s, y_s = load_subject("P4", subj)
+    mean_s = X_s.mean(axis=(0, 1), keepdims=True)
+    std_s  = X_s.std(axis=(0, 1),  keepdims=True) + 1e-8
+    X_s    = (X_s - mean_s) / std_s
+    X_list.append(X_s)
+    y_list.append(y_s)
+
+X = np.concatenate(X_list)
+y = np.concatenate(y_list)
 
 # Convert labels from {1,2} to {0,1}
 if set(np.unique(y)) == {1, 2}:
@@ -31,38 +45,37 @@ print("Dataset shape:", X.shape)   # (1400, 201, 6)
 print("Labels shape:", y.shape)    # (1400,)
 print("Unique labels:", np.unique(y, return_counts=True))
 
-# Reshape for EEGNet: (trials, channels, timepoints, 1)
-# EEGNet expects (batch, channels, time, 1) using Conv2D(1, T) style
-X_eeg = X.transpose(0, 2, 1)          # (1400, 6, 201)
-X_eeg = X_eeg[..., np.newaxis]        # (1400, 6, 201, 1)
-
-C = X_eeg.shape[1]   # 6 channels
-T = X_eeg.shape[2]   # 201 timepoints
+# Reshape for EEGNet: (trials, time, channels, 1)
+X_eeg = X[..., np.newaxis]        # (1400, 201, 6, 1)
+T = X_eeg.shape[1]                # 201 timepoints
+C = X_eeg.shape[2]                # 6 channels
 
 # EEGNet (Reference: Lawhern et al. 2018)
-# Uses 2D conv layers that act as 1D temporal + spatial filters
-# Block 1: temporal conv (1, T//2) then depthwise spatial conv (C, 1)
-# Block 2: separable conv (1, 16) for time summary + pointwise mixing
-def build_eegnet(C, T, F1=8, D=2, F2=16, dropout=0.5):
-    inputs = Input(shape=(C, T, 1))
+# Input: (batch, time, channels, 1)
+# Block 1: temporal convolution (T//2, 1) then depthwise spatial convolution (1, C)
+# Block 2: separable convolution (16, 1) for time summary + pointwise mixing
+def build_eegnet(T, C, F1=8, D=2, F2=16, dropout=0.5):
+    inputs = Input(shape=(T, C, 1))
 
     # Block 1 - Temporal convolution (learns frequency filters)
-    x = Conv2D(F1, (1, T // 2), padding="same", use_bias=False)(inputs)
+    x = Conv2D(F1, (T // 2, 1), padding="same", use_bias=False)(inputs)
     x = BatchNormalization()(x)
     # Depthwise spatial convolution (learns spatial filters per frequency)
-    x = DepthwiseConv2D((C, 1), depth_multiplier=D,
+    x = DepthwiseConv2D((1, C), depth_multiplier=D,
                          depthwise_constraint=max_norm(1.),
                          use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
-    x = AveragePooling2D((1, 4))(x)
+    x = AveragePooling2D((4, 1))(x)
     x = Dropout(dropout)(x)
+
     # Block 2 - Separable convolution (temporal summary + feature mixing)
-    x = SeparableConv2D(F2, (1, 16), padding="same", use_bias=False)(x)
+    x = SeparableConv2D(F2, (16, 1), padding="same", use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
-    x = AveragePooling2D((1, 8))(x)
+    x = AveragePooling2D((8, 1))(x)
     x = Dropout(dropout)(x)
+
     # Classifier
     x = Flatten()(x)
     outputs = Dense(1, activation="sigmoid",
@@ -73,14 +86,22 @@ def build_eegnet(C, T, F1=8, D=2, F2=16, dropout=0.5):
                   metrics=["accuracy"])
     return model
 
-# Baseline 1D CNN (for comparison)
+# Baseline CNN (for comparison)
+# L2 regularization + reduced model size to fix overfitting
+from tensorflow.keras.regularizers import l2
+
 def build_baseline_cnn(input_shape):
     model = Sequential([
         Input(shape=input_shape),
-        Conv2D(32, (1, 5), padding="same", activation="relu"),
-        Conv2D(64, (1, 5), padding="same", activation="relu"),
-        Dropout(0.3),
+        Conv2D(16, (5, 1), padding="same", activation="relu",
+               kernel_regularizer=l2(1e-4)),
+        Conv2D(32, (5, 1), padding="same", activation="relu",
+               kernel_regularizer=l2(1e-4)),
+        AveragePooling2D((4, 1)),
+        Dropout(0.5),                       
         Flatten(),
+        Dense(32, activation="relu", kernel_regularizer=l2(1e-4)),
+        Dropout(0.5),
         Dense(1, activation="sigmoid")
     ])
     model.compile(optimizer="adam",
@@ -101,9 +122,9 @@ plt.savefig("results/eeg_signal.png")
 plt.close()
 print("Saved: eeg_signal.png")
 
-# Visualization: Spectrogram
+# Visualization: Spectrogram 
 from scipy.signal import spectrogram as scipy_spectrogram
-f, t, Sxx = scipy_spectrogram(X[0][:, 0], fs=100)
+f, t, Sxx = scipy_spectrogram(X[0][:, 0], fs=100, nperseg=64)
 plt.pcolormesh(t, f, 10 * np.log10(Sxx + 1e-10), shading="gouraud")
 plt.ylabel("Frequency (Hz)")
 plt.xlabel("Time (s)")
@@ -115,7 +136,7 @@ print("Saved: spectrogram.png")
 
 # 5-Fold Cross Validation
 kf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-es = EarlyStopping(patience=5, restore_best_weights=True)
+es = EarlyStopping(patience=10, restore_best_weights=True)
 results = {"baseline": [], "eegnet": []}
 
 for fold, (train_idx, val_idx) in enumerate(kf.split(X_eeg, y)):
@@ -125,21 +146,21 @@ for fold, (train_idx, val_idx) in enumerate(kf.split(X_eeg, y)):
 
     # Baseline CNN
     cnn = build_baseline_cnn(X_tr.shape[1:])
-    cnn.fit(X_tr, y_tr, epochs=50, batch_size=32,
+    cnn.fit(X_tr, y_tr, epochs=100, batch_size=32,
             validation_split=0.1, callbacks=[es], verbose=0)
     _, acc = cnn.evaluate(X_val, y_val, verbose=0)
     results["baseline"].append(acc)
     print(f"Baseline CNN - Fold {fold+1}: {acc:.4f}")
 
     # EEGNet
-    eeg = build_eegnet(C, T)
-    eeg.fit(X_tr, y_tr, epochs=50, batch_size=32,
+    eeg = build_eegnet(T, C)
+    eeg.fit(X_tr, y_tr, epochs=100, batch_size=32,
             validation_split=0.1, callbacks=[es], verbose=0)
     _, acc = eeg.evaluate(X_val, y_val, verbose=0)
     results["eegnet"].append(acc)
     print(f"EEGNet       - Fold {fold+1}: {acc:.4f}")
 
-print("\n═Cross-Validation Results:")
+print("\n Cross-Validation Results:")
 for name, accs in results.items():
     print(f"{name}: {np.mean(accs):.4f} ± {np.std(accs):.4f}")
 
@@ -155,7 +176,7 @@ plt.xticks(x_pos, folds)
 plt.ylim(0.4, 1.0)
 plt.ylabel("Accuracy")
 plt.title("5-Fold Cross Validation: Baseline CNN vs EEGNet")
-plt.legend()
+plt.legend(loc="upper left")
 plt.savefig("results/cv_comparison.png")
 plt.close()
 print("Saved: cv_comparison.png")
@@ -164,8 +185,8 @@ print("Saved: cv_comparison.png")
 X_train, X_test, y_train, y_test = train_test_split(
     X_eeg, y, test_size=0.2, random_state=42, stratify=y)
 
-final_model = build_eegnet(C, T)
-history = final_model.fit(X_train, y_train, epochs=50, batch_size=32,
+final_model = build_eegnet(T, C)
+history = final_model.fit(X_train, y_train, epochs=100, batch_size=32,
                            validation_split=0.1, callbacks=[es], verbose=1)
 loss, acc = final_model.evaluate(X_test, y_test)
 print(f"\nFinal Test Accuracy (EEGNet): {acc:.4f}")
@@ -181,7 +202,7 @@ plt.plot(history.history["val_accuracy"], label="Validation")
 plt.title("Training Curve - EEGNet")
 plt.xlabel("Epoch")
 plt.ylabel("Accuracy")
-plt.legend()
+plt.legend(loc="lower right")
 plt.savefig("results/training_curve.png")
 plt.close()
 print("Saved: training_curve.png")
