@@ -66,14 +66,14 @@ def build_eegnet(T, C, F1=8, D=2, F2=16, dropout=0.5):
                          use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
-    x = AveragePooling2D((4, 1))(x)
+    x = AveragePooling2D((2, 1))(x)
     x = Dropout(dropout)(x)
 
     # Block 2 - Separable convolution (temporal summary + feature mixing)
     x = SeparableConv2D(F2, (16, 1), padding="same", use_bias=False)(x)
     x = BatchNormalization()(x)
     x = Activation("elu")(x)
-    x = AveragePooling2D((8, 1))(x)
+    x = AveragePooling2D((4, 1))(x)
     x = Dropout(dropout)(x)
 
     # Classifier
