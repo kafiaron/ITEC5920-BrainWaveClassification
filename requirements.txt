@@ -1,0 +1,8 @@
+numpy
+scipy
+scikit-learn
+pandas
+tabulate
+matplotlib
+pyriemann
+tensorflow>=2.16
